@@ -1,6 +1,7 @@
 # PyTorch
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Blocks
 from .repos.models.blocks import (
@@ -77,8 +78,56 @@ class SEQFormerEncoder(nn.Module):
             causal=params.get("causal", False)
         ) for block_id in range(params["num_blocks"])])
 
+        # chưa chỉnh lại với file config
+        self.ctc_projection = nn.Linear(
+            params["dim_model"][1] if isinstance(params["dim_model"], list) else params["dim_model"],
+            params["vocab_size"]  
+        )
+        
+        # Stage 3
+        self.stage_3 = ConformerBlock(
+            dim_model=params["dim_model"][2] if isinstance(params["dim_model"], list) else params["dim_model"],
+            dim_expand=params["dim_model"][2] if isinstance(params["dim_model"], list) else params["dim_model"],
+            ff_ratio=params["ff_ratio"],
+            num_heads=params["num_heads"][2] if isinstance(params["num_heads"], list) else params["num_heads"],
+            kernel_size=params["kernel_size"][2] if isinstance(params["kernel_size"], list) else params["kernel_size"],
+            att_group_size=params["att_group_size"][2] if isinstance(params.get("att_group_size", 1), list) else params["att_group_size"],
+            att_kernel_size=params["att_kernel_size"][2] if isinstance(params.get("att_kernel_size", None), list) else params.get("att_kernel_size", None),
+            linear_att=params.get("linear_att", False),
+            Pdrop=params["Pdrop"], 
+            relative_pos_enc=params["relative_pos_enc"], 
+            max_pos_encoding=params["max_pos_encoding"] // params.get("stride", 2),
+            conv_stride=(params["conv_stride"][2] if isinstance(params["conv_stride"], list) else params["conv_stride"]) if 2 in params.get("strided_blocks", []) else 1,
+            att_stride= (params["att_stride"][2] if isinstance(params["att_stride"], list) else params["att_stride"]) if 2 in params.get("strided_blocks", []) else 1,
+            causal=params.get("causal", False)
+        )
+
+    def compute_atten_mask_from_ctc_loss(self, x, target_len, targets=None):
+        # Tính CTC logits
+        ctc_logits = self.ctc_projection(x)  # (B, T, vocab_size)
+        
+        if targets is not None:
+            # Tính CTC loss
+            log_probs = F.log_softmax(ctc_logits, dim=-1)
+            ctc_loss = F.ctc_loss(
+                log_probs.transpose(0, 1),  # (T, B, vocab_size)
+                targets,
+                input_lengths=torch.full((x.size(0),), x.size(1), dtype=torch.long),
+                target_lengths=target_len
+            )
+            
+            # Tính attention mask dựa trên confidence score
+            confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]  # (B, T)
+            attention_mask = (confidence > 0.5).float()  # threshold có thể điều chỉnh
+            
+            return attention_mask, ctc_loss
+        else:
+            # Inference mode - chỉ tính attention mask
+            confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]
+            attention_mask = (confidence > 0.5).float()
+            return attention_mask, None    
     
-    def forward(self, x, x_len=None):
+    def forward(self, x, x_len=None, targets=None, target_len=None):
 
         # Audio Preprocessing
         x, x_len = self.preprocessing(x, x_len)
@@ -122,6 +171,23 @@ class SEQFormerEncoder(nn.Module):
                 # Update Seq Lengths
                 if x_len is not None:
                     x_len = torch.div(x_len - 1, block.stride, rounding_mode='floor') + 1
+        
+        # stage 2.5
+        attention_mask, ctc_loss = self.compute_atten_mask_from_ctc_loss(x, target_len, targets)
+        
+        # attention_mask (B, T) -> (B, 1, T, T)
+        stage3_mask = mask
+        if attention_mask is not None:
+            bool_mask = attention_mask.bool()
+            att_mask_expanded = bool_mask.unsqueeze(1).unsqueeze(3) & bool_mask.unsqueeze(1).unsqueeze(2)
+            if stage3_mask is not None:
+                stage3_mask = stage3_mask & att_mask_expanded
+            else:
+                stage3_mask = att_mask_expanded
+
+        # stage 3
+        x, attention3, hidden3 = self.stage_3(x, stage3_mask)
+        attentions.append(attention3)
 
         return x, x_len, attentions
     
