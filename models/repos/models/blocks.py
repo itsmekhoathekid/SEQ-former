@@ -17,14 +17,14 @@ import torch
 import torch.nn as nn
 
 # Modules
-from models.modules import (
+from .modules import (
     FeedForwardModule,
     MultiHeadSelfAttentionModule,
     ConvolutionModule
 )
 
 # Layers
-from models.layers import (
+from .layers import (
     Conv1d,
     Transpose
 )

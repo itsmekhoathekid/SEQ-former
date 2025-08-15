@@ -1,28 +1,14 @@
-# Copyright 2021, Maxime Burchi.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 # PyTorch
 import torch
 import torch.nn as nn
 
 # Blocks
-from models.blocks import (
+from .repos.models.blocks import (
     ConformerBlock
 )
 
 # Modules
-from models.modules import (
+from .repos.models.modules import (
     AudioPreprocessing,
     SpecAugment,
     Conv1dSubsampling,
@@ -32,19 +18,15 @@ from models.modules import (
 )
 
 # Positional Encodings and Masks
-from models.attentions import (
+from .repos.models.attentions import (
     SinusoidalPositionalEncoding,
     StreamingMask
 )
 
-###############################################################################
-# Encoder Models
-###############################################################################
 
-class ConformerEncoder(nn.Module):
-
+class SEQFormerEncoder(nn.Module):
     def __init__(self, params):
-        super(ConformerEncoder, self).__init__()
+        super(SEQFormerEncoder, self).__init__()
 
         # Audio Preprocessing
         self.preprocessing = AudioPreprocessing(params["sample_rate"], params["n_fft"], params["win_length_ms"], params["hop_length_ms"], params["n_mels"], params["normalize"], params["mean"], params["std"])
@@ -64,6 +46,7 @@ class ConformerEncoder(nn.Module):
         else:
             raise Exception("Unknown subsampling module:", params["subsampling_module"])
         
+
         # Padding Mask
         self.padding_mask = StreamingMask(left_context=params.get("left_context", params["max_pos_encoding"]), right_context=0 if params.get("causal", False) else params.get("right_context", params["max_pos_encoding"]))
 
@@ -75,9 +58,9 @@ class ConformerEncoder(nn.Module):
 
         # Sinusoidal Positional Encodings
         self.pos_enc = None if params["relative_pos_enc"] else SinusoidalPositionalEncoding(params["max_pos_encoding"], params["dim_model"][0] if isinstance(params["dim_model"], list) else  params["dim_model"])
-        
-        # Conformer Blocks
-        self.blocks = nn.ModuleList([ConformerBlock(
+
+
+        self.stage_1n2 = self.blocks = nn.ModuleList([ConformerBlock(
             dim_model=params["dim_model"][(block_id > torch.tensor(params.get("expand_blocks", []))).sum()] if isinstance(params["dim_model"], list) else params["dim_model"],
             dim_expand=params["dim_model"][(block_id >= torch.tensor(params.get("expand_blocks", []))).sum()] if isinstance(params["dim_model"], list) else params["dim_model"],
             ff_ratio=params["ff_ratio"],
@@ -94,6 +77,7 @@ class ConformerEncoder(nn.Module):
             causal=params.get("causal", False)
         ) for block_id in range(params["num_blocks"])])
 
+    
     def forward(self, x, x_len=None):
 
         # Audio Preprocessing
@@ -122,9 +106,9 @@ class ConformerEncoder(nn.Module):
         if self.pos_enc is not None:
             x = x + self.pos_enc(x.size(0), x.size(1))
 
-        # Conformer Blocks
+        # stage 1 and 2  
         attentions = []
-        for block in self.blocks:
+        for block in self.stage_1n2:
             x, attention, hidden = block(x, mask)
             attentions.append(attention)
 
@@ -140,76 +124,4 @@ class ConformerEncoder(nn.Module):
                     x_len = torch.div(x_len - 1, block.stride, rounding_mode='floor') + 1
 
         return x, x_len, attentions
-
-class ConformerEncoderInterCTC(ConformerEncoder):
-
-    def __init__(self, params):
-        super(ConformerEncoderInterCTC, self).__init__(params)
-
-        # Inter CTC blocks
-        self.interctc_blocks = params["interctc_blocks"]
-        for block_id in params["interctc_blocks"]:
-            self.__setattr__(
-                name="linear_expand_" + str(block_id), 
-                value=nn.Linear(
-                    in_features=params["dim_model"][(block_id >= torch.tensor(params.get("expand_blocks", []))).sum()] if isinstance(params["dim_model"], list) else params["dim_model"],
-                    out_features=params["vocab_size"]))
-            self.__setattr__(
-                name="linear_proj_" + str(block_id),
-                value=nn.Linear(
-                    in_features=params["vocab_size"],
-                    out_features=params["dim_model"][(block_id >= torch.tensor(params.get("expand_blocks", []))).sum()] if isinstance(params["dim_model"], list) else params["dim_model"]))
-
-    def forward(self, x, x_len=None):
-
-        # Audio Preprocessing
-        x, x_len = self.preprocessing(x, x_len)
-
-        # Spec Augment
-        if self.training:
-            x = self.augment(x, x_len)
-
-        # Subsampling Module
-        x, x_len = self.subsampling_module(x, x_len)
-
-        # Padding Mask
-        mask = self.padding_mask(x, x_len)
-
-        # Transpose (B, D, T) -> (B, T, D)
-        x = x.transpose(1, 2)
-
-        # Linear Projection
-        x = self.linear(x)
-
-        # Dropout
-        x = self.dropout(x)
-
-        # Sinusoidal Positional Encodings
-        if self.pos_enc is not None:
-            x = x + self.pos_enc(x.size(0), x.size(1))
-
-        # Conformer Blocks
-        attentions = []
-        interctc_probs = []
-        for block_id, block in enumerate(self.blocks):
-            x, attention, hidden = block(x, mask)
-            attentions.append(attention)
-
-            # Strided Block
-            if block.stride > 1:
-
-                # Stride Mask (B, 1, T // S, T // S)
-                if mask is not None:
-                    mask = mask[:, :, ::block.stride, ::block.stride]
-
-                # Update Seq Lengths
-                if x_len is not None:
-                    x_len = torch.div(x_len - 1, block.stride, rounding_mode='floor') + 1
-
-            # Inter CTC Block
-            if block_id in self.interctc_blocks:
-                interctc_prob = self.__getattr__("linear_expand_" + str(block_id))(x).softmax(dim=-1)
-                interctc_probs.append(interctc_prob)
-                x = x + self.__getattr__("linear_proj_" + str(block_id))(interctc_prob)
-
-        return x, x_len, attentions, interctc_probs
+    

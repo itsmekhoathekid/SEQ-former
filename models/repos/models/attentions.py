@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Layers
-from models.layers import (
+from .layers import (
     Linear
 )
 
