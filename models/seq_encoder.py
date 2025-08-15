@@ -226,7 +226,7 @@ class SEQFormerEncoder(nn.Module):
         # phải truyền vocab size vào để tính log_softmax
         # x = (B, T, D)
         log_probs = self.compute_log_softmax(x, x.size(-1), 100000)  # Giả sử vocab_size là 100000
-        
+        stage_25_mask = self.compute_inter_CTC_attn_mask(log_probs, n=2, m=2, causal=True, threshold=0.5, base_mask=mask)
 
         # stage 3
         stage3_mask = 0 # để tạm
