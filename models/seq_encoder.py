@@ -77,12 +77,6 @@ class SEQFormerEncoder(nn.Module):
             att_stride=(params["att_stride"][(block_id > torch.tensor(params.get("strided_blocks", []))).sum()] if isinstance(params["att_stride"], list) else params["att_stride"]) if block_id in params.get("strided_blocks", []) else 1,
             causal=params.get("causal", False)
         ) for block_id in range(params["num_blocks"])])
-
-        # chưa chỉnh lại với file config
-        self.ctc_projection = nn.Linear(
-            params["dim_model"][1] if isinstance(params["dim_model"], list) else params["dim_model"],
-            params["vocab_size"]  
-        )
         
         # Stage 3
         self.stage_3 = ConformerBlock(
@@ -102,30 +96,85 @@ class SEQFormerEncoder(nn.Module):
             causal=params.get("causal", False)
         )
 
-    def compute_atten_mask_from_ctc_loss(self, x, target_len, targets=None):
-        # Tính CTC logits
-        ctc_logits = self.ctc_projection(x)  # (B, T, vocab_size)
+    # def compute_atten_mask_from_ctc_loss(self, x, target_len, targets=None):
+    #     # Tính CTC logits
+    #     ctc_logits = self.ctc_projection(x)  # (B, T, vocab_size)
         
-        if targets is not None:
-            # Tính CTC loss
-            log_probs = F.log_softmax(ctc_logits, dim=-1)
-            ctc_loss = F.ctc_loss(
-                log_probs.transpose(0, 1),  # (T, B, vocab_size)
-                targets,
-                input_lengths=torch.full((x.size(0),), x.size(1), dtype=torch.long),
-                target_lengths=target_len
-            )
+    #     if targets is not None:
+    #         # Tính CTC loss
+    #         log_probs = F.log_softmax(ctc_logits, dim=-1)
+    #         ctc_loss = F.ctc_loss(
+    #             log_probs.transpose(0, 1),  # (T, B, vocab_size)
+    #             targets,
+    #             input_lengths=torch.full((x.size(0),), x.size(1), dtype=torch.long),
+    #             target_lengths=target_len
+    #         )
             
-            # Tính attention mask dựa trên confidence score
-            confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]  # (B, T)
-            attention_mask = (confidence > 0.5).float()  # threshold có thể điều chỉnh
+    #         # Tính attention mask dựa trên confidence score
+    #         confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]  # (B, T)
+    #         attention_mask = (confidence > 0.5).float()  # threshold có thể điều chỉnh
             
-            return attention_mask, ctc_loss
-        else:
-            # Inference mode - chỉ tính attention mask
-            confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]
-            attention_mask = (confidence > 0.5).float()
-            return attention_mask, None    
+    #         return attention_mask, ctc_loss
+    #     else:
+    #         # Inference mode - chỉ tính attention mask
+    #         confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]
+    #         attention_mask = (confidence > 0.5).float()
+    #         return attention_mask, None    
+
+    def compute_log_softmax(ctc_logits, d_in, vocab_size):
+        linear_layer = nn.Linear(d_in, vocab_size)
+        log_probs = F.log_softmax(linear_layer(ctc_logits), dim=-1)
+
+        return log_probs 
+            
+    def  compute_inter_CTC_attn_mask(self, logits, n, m, causal, threshold=0.5, base_mask=None):
+        B, T, V = logits.size()
+
+        # Check active frames  
+        conf, _ = logits.max(dim=-1)  # (B, T)
+        active = conf > threshold  # (B, T)
+
+        w = torch.zeros(active, dtype=torch.float32, device=logits.device)  # (B, T)
+        # output là (B, T)
+        for i in range(-n, m+1): 
+            src_from = max(0, -i)
+            src_to   = T - max(0, i)
+            if src_to > src_from:
+                w[:, src_from:src_to] |= active[:, src_from + i: src_to + i]
+
+        out_mask = torch.zeros((B, 1, T, T), dtype=torch.bool, device=logits.device) # (B, 1, T, T)
+
+        def enable_block(mask_b, a, b):
+            # clamp
+            a = max(0, a); b = min(T - 1, b)
+            if a <= b:
+                mask_b[:, a:b+1, a:b+1] = True
+
+        for b in range(B):
+            # duyệt qua từng batch, lấy vector boolean từ w đã xử lý, nếu full false thì bỏ qua để không phải tính toán
+            vec = w[b]  # (T,)
+            if not vec.any():
+                continue
+
+            # edges of True segments
+            on = vec.int() # true false to int 
+            diff = torch.diff(torch.cat([torch.tensor([0], device=logits.device), on, torch.tensor([0], device=logits.device)]))
+            # starts where diff==+1, ends where diff==-1 then -1 for inclusive index
+            starts = (diff == 1).nonzero(as_tuple=False).flatten()
+            ends   = (diff == -1).nonzero(as_tuple=False).flatten() - 1
+            # build rectangles
+            mb = out_mask[b:b+1]  # (1,1,T,T)
+            for s, e in zip(starts.tolist(), ends.tolist()):
+                enable_block(mb, s, e)
+
+        if causal:
+                tri = torch.tril(torch.ones((T, T), dtype=torch.bool, device=logits.device))
+                out_mask = out_mask & tri.view(1, 1, T, T)
+
+        if base_mask is not None:
+            out_mask = out_mask & base_mask
+
+        return out_mask
     
     def forward(self, x, x_len=None, targets=None, target_len=None):
 
@@ -156,6 +205,7 @@ class SEQFormerEncoder(nn.Module):
             x = x + self.pos_enc(x.size(0), x.size(1))
 
         # stage 1 and 2  
+        # return x, attention, hidden
         attentions = []
         for block in self.stage_1n2:
             x, attention, hidden = block(x, mask)
@@ -173,19 +223,13 @@ class SEQFormerEncoder(nn.Module):
                     x_len = torch.div(x_len - 1, block.stride, rounding_mode='floor') + 1
         
         # stage 2.5
-        attention_mask, ctc_loss = self.compute_atten_mask_from_ctc_loss(x, target_len, targets)
+        # phải truyền vocab size vào để tính log_softmax
+        # x = (B, T, D)
+        log_probs = self.compute_log_softmax(x, x.size(-1), 100000)  # Giả sử vocab_size là 100000
         
-        # attention_mask (B, T) -> (B, 1, T, T)
-        stage3_mask = mask
-        if attention_mask is not None:
-            bool_mask = attention_mask.bool()
-            att_mask_expanded = bool_mask.unsqueeze(1).unsqueeze(3) & bool_mask.unsqueeze(1).unsqueeze(2)
-            if stage3_mask is not None:
-                stage3_mask = stage3_mask & att_mask_expanded
-            else:
-                stage3_mask = att_mask_expanded
 
         # stage 3
+        stage3_mask = 0 # để tạm
         x, attention3, hidden3 = self.stage_3(x, stage3_mask)
         attentions.append(attention3)
 
