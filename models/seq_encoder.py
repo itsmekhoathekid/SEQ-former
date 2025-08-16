@@ -78,6 +78,10 @@ class SEQFormerEncoder(nn.Module):
             causal=params.get("causal", False)
         ) for block_id in range(params["num_blocks"])])
         
+        # stage 2.5 
+        # self.s25_ln = nn.Linear(params["dim_model"][1] if isinstance(params["dim_model"], list) else params["dim_model"], params["vocab_size"])
+        self.s25_ln = nn.Linear(params["dim_model"][1] if isinstance(params["dim_model"], list) else params["dim_model"], 4866)
+        
         # Stage 3
         self.stage_3 = ConformerBlock(
             dim_model=params["dim_model"][2] if isinstance(params["dim_model"], list) else params["dim_model"],
@@ -94,87 +98,52 @@ class SEQFormerEncoder(nn.Module):
             conv_stride=(params["conv_stride"][2] if isinstance(params["conv_stride"], list) else params["conv_stride"]) if 2 in params.get("strided_blocks", []) else 1,
             att_stride= (params["att_stride"][2] if isinstance(params["att_stride"], list) else params["att_stride"]) if 2 in params.get("strided_blocks", []) else 1,
             causal=params.get("causal", False)
-        )
+        )    
+    
+    def keyframe_chunk_mask(
+            self,
+            peaks_masks: torch.Tensor,
+            xs_lens: torch.Tensor,
+    ) -> torch.Tensor:
 
-    # def compute_atten_mask_from_ctc_loss(self, x, target_len, targets=None):
-    #     # Tính CTC logits
-    #     ctc_logits = self.ctc_projection(x)  # (B, T, vocab_size)
-        
-    #     if targets is not None:
-    #         # Tính CTC loss
-    #         log_probs = F.log_softmax(ctc_logits, dim=-1)
-    #         ctc_loss = F.ctc_loss(
-    #             log_probs.transpose(0, 1),  # (T, B, vocab_size)
-    #             targets,
-    #             input_lengths=torch.full((x.size(0),), x.size(1), dtype=torch.long),
-    #             target_lengths=target_len
-    #         )
-            
-    #         # Tính attention mask dựa trên confidence score
-    #         confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]  # (B, T)
-    #         attention_mask = (confidence > 0.5).float()  # threshold có thể điều chỉnh
-            
-    #         return attention_mask, ctc_loss
-    #     else:
-    #         # Inference mode - chỉ tính attention mask
-    #         confidence = F.softmax(ctc_logits, dim=-1).max(dim=-1)[0]
-    #         attention_mask = (confidence > 0.5).float()
-    #         return attention_mask, None    
+        B, T = peaks_masks.size()
+        # compute peaks index
+        def generate_peak_index(b):
+            peak = []
+            for t in range(T):
+                if not peaks_masks[b, t]: continue
+                if t == 0: peak.append(t)
+                elif peaks_masks[b, t-1] != peaks_masks[b, t]: peak.append(t)
+            if len(peak) == 0: peak = [1]
+            return peak
+        # rewrite in 10.l1
+        peaks_index = [generate_peak_index(b) for b in range(B)]
+ 
+   
+     
+       
+        # compute peak based chunk mask for KFSA
+        left, right = 2, 3
+        def compute_peak_mask(i):
+            peaks = peaks_index[i]
+            lens = xs_lens[i]
+            re = torch.zeros(T, T) != 0
+            if len(peaks) == 0 : return re == False
 
-    def compute_log_softmax(ctc_logits, d_in, vocab_size):
-        linear_layer = nn.Linear(d_in, vocab_size)
-        log_probs = F.log_softmax(linear_layer(ctc_logits), dim=-1)
+            chunks = [[max(p - left, 0), min(p + right, lens)]  for p in peaks]
+            for ch in range(1, len(chunks)):
+                if chunks[ch][0] < chunks[ch-1][1]:
+                    mid = (chunks[ch][0] + chunks[ch-1][1] + 1) // 2
+                    chunks[ch-1][1] = mid
+                    chunks[ch][0] = mid
 
-        return log_probs 
-            
-    def  compute_inter_CTC_attn_mask(self, logits, n, m, causal, threshold=0.5, base_mask=None):
-        B, T, V = logits.size()
-
-        # Check active frames  
-        conf, _ = logits.max(dim=-1)  # (B, T)
-        active = conf > threshold  # (B, T)
-
-        w = torch.zeros(active, dtype=torch.float32, device=logits.device)  # (B, T)
-        # output là (B, T)
-        for i in range(-n, m+1): 
-            src_from = max(0, -i)
-            src_to   = T - max(0, i)
-            if src_to > src_from:
-                w[:, src_from:src_to] |= active[:, src_from + i: src_to + i]
-
-        out_mask = torch.zeros((B, 1, T, T), dtype=torch.bool, device=logits.device) # (B, 1, T, T)
-
-        def enable_block(mask_b, a, b):
-            # clamp
-            a = max(0, a); b = min(T - 1, b)
-            if a <= b:
-                mask_b[:, a:b+1, a:b+1] = True
-
-        for b in range(B):
-            # duyệt qua từng batch, lấy vector boolean từ w đã xử lý, nếu full false thì bỏ qua để không phải tính toán
-            vec = w[b]  # (T,)
-            if not vec.any():
-                continue
-
-            # edges of True segments
-            on = vec.int() # true false to int 
-            diff = torch.diff(torch.cat([torch.tensor([0], device=logits.device), on, torch.tensor([0], device=logits.device)]))
-            # starts where diff==+1, ends where diff==-1 then -1 for inclusive index
-            starts = (diff == 1).nonzero(as_tuple=False).flatten()
-            ends   = (diff == -1).nonzero(as_tuple=False).flatten() - 1
-            # build rectangles
-            mb = out_mask[b:b+1]  # (1,1,T,T)
-            for s, e in zip(starts.tolist(), ends.tolist()):
-                enable_block(mb, s, e)
-
-        if causal:
-                tri = torch.tril(torch.ones((T, T), dtype=torch.bool, device=logits.device))
-                out_mask = out_mask & tri.view(1, 1, T, T)
-
-        if base_mask is not None:
-            out_mask = out_mask & base_mask
-
-        return out_mask
+            for ch in chunks:
+                re[ch[0]:ch[1], ch[0]:ch[1]] = True
+                re[ch[0]:ch[1], peaks] = True
+            return re
+        ret = [compute_peak_mask(i) for i in range(B)]
+        ret = torch.stack(ret, dim=0)
+        return ret
     
     def forward(self, x, x_len=None, targets=None, target_len=None):
 
@@ -221,17 +190,89 @@ class SEQFormerEncoder(nn.Module):
                 # Update Seq Lengths
                 if x_len is not None:
                     x_len = torch.div(x_len - 1, block.stride, rounding_mode='floor') + 1
-        
+
         # stage 2.5
         # phải truyền vocab size vào để tính log_softmax
-        # x = (B, T, D)
-        log_probs = self.compute_log_softmax(x, x.size(-1), 100000)  # Giả sử vocab_size là 100000
-        stage_25_mask = self.compute_inter_CTC_attn_mask(log_probs, n=2, m=2, causal=True, threshold=0.5, base_mask=mask)
+        # x = (B, T, D) -> (B, T, vocab_size)
+        x_25 = self.s25_ln(x)
+        log_probs = F.log_softmax(x_25, dim= -1)
+        preds_25 = torch.argmax(log_probs, dim=-1)
+
+        blank_id = 0   # hoặc id bạn dùng
+        non_blank = (preds_25 != blank_id)
+        shifted = F.pad(preds_25[:, :-1], (1,0), value=-1)
+        is_new = (preds_25 != shifted)
+        peaks_masks = non_blank & is_new   # (B, T) bool
+
+        # calculate keyframe chunk mask
+        kfsa_mat = self.keyframe_chunk_mask(peaks_masks, x_len)  # (B, T, T)
+        kfsa_mat = kfsa_mat.unsqueeze(1)  # (B, 1, T, T)
+
+        combined_mask = mask & kfsa_mat  # vẫn shape (B, 1, T, T)
 
         # stage 3
-        stage3_mask = 0 # để tạm
-        x, attention3, hidden3 = self.stage_3(x, stage3_mask)
+        x, attention3, hidden3 = self.stage_3(x, combined_mask)
         attentions.append(attention3)
 
         return x, x_len, attentions
+
+
+def get_dummy_params():
+    params = {
+        "arch": "Conformer",
+        "num_blocks": 15,
+        "dim_model": [100, 140, 160],
+        "ff_ratio": 4,
+        "num_heads": 4,
+        "kernel_size": 15,
+        "Pdrop": 0.1,
+        "conv_stride": 2,
+        "att_stride": 1,
+        "strided_blocks": [2],
+        "expand_blocks": [2],
+        "att_group_size": [3, 1, 1],
+
+        "relative_pos_enc": True,
+        "max_pos_encoding": 10000,
+
+        "subsampling_module": "Conv2d",
+        "subsampling_layers": 1,
+        "subsampling_filters": [100],
+        "subsampling_kernel_size": 3,
+        "subsampling_norm": "batch",
+        "subsampling_act": "swish",
+
+        "sample_rate": 16000,
+        "win_length_ms": 25,
+        "hop_length_ms": 10,
+        "n_fft": 512,
+        "n_mels": 80,
+        "normalize": False,
+        "mean": -5.6501,
+        "std": 4.2280,
+
+        "spec_augment": True,
+        "mF": 2,
+        "F": 27,
+        "mT": 10,
+        "pS": 0.05
+    }
+    return params
+
+if __name__ == "__main__":
+    params = get_dummy_params()
+    encoder = SEQFormerEncoder(params)
+    
+    # Giả sử đầu vào là waveform có batch_size=2, độ dài 16000 mẫu (sample)
+    batch_size = 2
+    signal_length = 16000
+    x = torch.randn(batch_size, signal_length)
+    x_len = torch.full((batch_size,), signal_length, dtype=torch.int32)
+    
+    # Chạy forward
+    x_out, x_out_len, attentions = encoder(x, x_len)
+    
+    print("Output shape:", x_out.shape)
+    print("Output lengths:", x_out_len)
+    print("Number of attention maps:", len(attentions))
     
