@@ -194,11 +194,13 @@ class SEQFormerEncoder(nn.Module):
         log_probs = F.log_softmax(x_25, dim= -1)
         preds_25 = torch.argmax(log_probs, dim=-1)
 
-        blank_id = 0   # hoặc id bạn dùng
-        non_blank = (preds_25 != blank_id)
-        shifted = F.pad(preds_25[:, :-1], (1,0), value=-1)
-        is_new = (preds_25 != shifted)
-        peaks_masks = non_blank & is_new   # (B, T) bool
+        peaks_masks = preds_25.detach()
+
+        # blank_id = 0   # hoặc id bạn dùng
+        # non_blank = (preds_25 != blank_id)
+        # shifted = F.pad(preds_25[:, :-1], (1,0), value=-1)
+        # is_new = (preds_25 != shifted)
+        # peaks_masks = non_blank & is_new   # (B, T) bool
 
         # calculate keyframe chunk mask
         kfsa_mat = self.keyframe_chunk_mask(peaks_masks, x_len)  # (B, T, T)
