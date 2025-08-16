@@ -196,7 +196,7 @@ class SEQFormerEncoder(nn.Module):
 
         peaks_masks = preds_25.detach()
 
-        # blank_id = 0   # hoặc id bạn dùng
+        blank_id = 0   
         # non_blank = (preds_25 != blank_id)
         # shifted = F.pad(preds_25[:, :-1], (1,0), value=-1)
         # is_new = (preds_25 != shifted)
@@ -206,7 +206,7 @@ class SEQFormerEncoder(nn.Module):
         kfsa_mat = self.keyframe_chunk_mask(peaks_masks, x_len)  # (B, T, T)
         kfsa_mat = kfsa_mat.unsqueeze(1)  # (B, 1, T, T)
 
-        # combined_mask = mask & kfsa_mat  # vẫn shape (B, 1, T, T)
+        combined_mask = mask.bool() & kfsa_mat  # vẫn shape (B, 1, T, T)
 
         # calc inter ctc spike reduce loss
         if self.training and targets is not None:
@@ -220,7 +220,7 @@ class SEQFormerEncoder(nn.Module):
             )
 
         # stage 3
-        x, attention3, hidden3 = self.stage_3(x, kfsa_mat)
+        x, attention3, hidden3 = self.stage_3(x, combined_mask)
         attentions.append(attention3)
 
         return x, x_len, attentions
