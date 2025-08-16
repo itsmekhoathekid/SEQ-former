@@ -84,7 +84,7 @@ class SEQFormerEncoder(nn.Module):
         
         # Stage 3
         self.stage_3 = ConformerBlock(
-            dim_model=params["dim_model"][2] if isinstance(params["dim_model"], list) else params["dim_model"],
+            dim_model=params["dim_model"][1] if isinstance(params["dim_model"], list) else params["dim_model"],
             dim_expand=params["dim_model"][2] if isinstance(params["dim_model"], list) else params["dim_model"],
             ff_ratio=params["ff_ratio"],
             num_heads=params["num_heads"][2] if isinstance(params["num_heads"], list) else params["num_heads"],
@@ -169,7 +169,6 @@ class SEQFormerEncoder(nn.Module):
         # Sinusoidal Positional Encodings
         if self.pos_enc is not None:
             x = x + self.pos_enc(x.size(0), x.size(1))
-
         # stage 1 and 2  
         # return x, attention, hidden
         attentions = []
@@ -205,7 +204,7 @@ class SEQFormerEncoder(nn.Module):
         kfsa_mat = self.keyframe_chunk_mask(peaks_masks, x_len)  # (B, T, T)
         kfsa_mat = kfsa_mat.unsqueeze(1)  # (B, 1, T, T)
 
-        combined_mask = mask & kfsa_mat  # vẫn shape (B, 1, T, T)
+        # combined_mask = mask & kfsa_mat  # vẫn shape (B, 1, T, T)
 
         # calc inter ctc spike reduce loss
         if self.training and targets is not None:
@@ -219,7 +218,7 @@ class SEQFormerEncoder(nn.Module):
             )
 
         # stage 3
-        x, attention3, hidden3 = self.stage_3(x, combined_mask)
+        x, attention3, hidden3 = self.stage_3(x, kfsa_mat)
         attentions.append(attention3)
 
         return x, x_len, attentions
