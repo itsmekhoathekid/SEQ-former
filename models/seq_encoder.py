@@ -210,14 +210,14 @@ class SEQFormerEncoder(nn.Module):
         # calc inter ctc spike reduce loss
         if self.training and targets is not None:
             log_probs_ctc = log_probs.permute(1, 0, 2)
-            ctc_loss_fn = nn.CTCLoss(blank=self.blank_id, reduction="mean", zero_infinity=True)
+            ctc_loss_fn = nn.CTCLoss(blank=blank_id, reduction="mean", zero_infinity=True)
             loss_inter = ctc_loss_fn(
                 log_probs_ctc,    # (T, B, V)
                 targets,          
                 input_lengths=x_len,   
                 target_lengths=target_len  
             )
-            
+
         # stage 3
         x, attention3, hidden3 = self.stage_3(x, combined_mask)
         attentions.append(attention3)
