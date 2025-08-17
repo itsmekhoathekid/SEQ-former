@@ -104,6 +104,8 @@ class SEQFormerEncoder(nn.Module):
             self,
             peaks_masks: torch.Tensor,
             xs_lens: torch.Tensor,
+            left = 2,
+            right = 3 
     ) -> torch.Tensor:
         B, T = peaks_masks.size()
         # compute peaks index
@@ -118,8 +120,6 @@ class SEQFormerEncoder(nn.Module):
         # rewrite in 10.l1
         peaks_index = [generate_peak_index(b) for b in range(B)]
  
-        # compute peak based chunk mask for KFSA
-        left, right = 2, 3
         def compute_peak_mask(i):
             peaks = peaks_index[i]
             lens = xs_lens[i]
